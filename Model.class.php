@@ -41,7 +41,7 @@ abstract class Model{
 		
 		 
 		
-	public function find( $arguments ){
+	public function find( $arguments = null ){
 		
 		//Ensure connection is established to the database..
 		$this->mysqliConnect();
@@ -170,17 +170,14 @@ abstract class Model{
 		if( !$mysqlProcedure = $this->mysqli->prepare( $sqlQuery ) )
 			throw new Exception( "(" . $this->mysqli->errno . ") " . $this->mysqli->error);
 			
-		//Bind the condition values to the SQL query
-		call_user_func_array(array(&$mysqlProcedure,'bind_param'), $this->refValues($sqlConditions['parameters']));
+		//Bind the condition values to the SQL query (if there is any)
+		if( !empty($sqlConditions['parameters'][0]))
+			call_user_func_array(array(&$mysqlProcedure,'bind_param'), $this->refValues($sqlConditions['parameters']));
 		
-		
-		
-		//Execute the command:
-		$mysqlProcedure->execute();
 		
 		//Get the meta data for query (for field names)
 		$meta = $mysqlProcedure->result_metadata();
-
+		
 	    // Dynamically create the array of fields returned
 	    while ($field = $meta->fetch_field()) { 
 	        $var = $field->name; 
@@ -189,37 +186,26 @@ abstract class Model{
 	    }
 	    
 		//print_r($returnedFields);
-		
+		//print_r($fields);
 	    // Bind Results
 	    call_user_func_array(array($mysqlProcedure,'bind_result'),$returnedFields);
-	
-	    // Fetch Results
-	    $i = 0;
-	    while ($mysqlProcedure->fetch()) {
-	        $results[$i] = array();
-	        foreach($returnedFields as $k => $v){
-		        
-		        $results[$i][$k] = $v;
-		        
-	        }
-	            
-	        $i++;
-	    }
-	    
-	    $returnObjects = array();
-	    
-	    
-				
-		
-		
-		//Exectue the query..
+		    
+	    //Exectue the query..
+	    if( !$mysqlProcedure->execute() )
+			throw new Exception( "(" . $mysqlProcedure->errno . ") " . $mysqlProcedure->error);
+			
 		$mysqlProcedure->execute();
 		
-		//this array will hold the objects we are looking for
+		//this array will hold the objects which are returned
 		$objects = array();
 		
 		//This will be the base object which will be cloned for loading properties
 		$baseObject = new $this->objectName;
+		
+		foreach( $hasMany as $childModel => $childObject ){
+				
+			$baseObject->$childModel = array();
+		}
 		
 		$result = $mysqlProcedure->get_result();
 		
@@ -228,33 +214,75 @@ abstract class Model{
 			
 			//print_r($row);
 			
-			$object = clone $baseObject;
+			//Check if this object has been seen in the previous row..
+			if( $objects[count($objects)-1]->id != $row[$this->objectName.'.id'] ){
 			
-			//Set up the belongsTo objects if any exist...
-			foreach( $belongsTo as $parentModel => $parentObject ){
+				$object = clone $baseObject;
 				
-				$object->$parentModel = clone $parentObject;
-			}
-			
-			
-			//Get every value returned from the databae and add it to the object
-			foreach( $row as $key => $value ){
-				
-				//Find what object and field it is..
-				$returnField = explode(".",$key);
-				
-				if( $returnField[0] == $this->objectName ){
+				//Check if there is hasMany objects, and add blank clones
+				foreach( $hasMany as $childModel => $childObject ){
 					
-					$object->$returnField[1] = $value;
-				
-					//Check what the relationship os between the return table and current obejct..
-				}else if( isset( $belongsTo[$returnField[0]] ) ){
-					
-					$object->{$returnField[0]}->$returnField[1] = $value;
+					$object->{$childModel}[] = clone $childObject;
 				}
+				
+				//Set up the belongsTo objects if any exist...
+				foreach( $belongsTo as $parentModel => $parentObject ){
+					
+					$object->$parentModel = clone $parentObject;
+				}
+				
+				
+				//Get every value returned from the databae and add it to the object
+				foreach( $row as $key => $value ){
+					
+					//Find what object and field it is..
+					$returnField = explode(".",$key);
+					
+					if( $returnField[0] == $this->objectName ){
+						
+						$object->$returnField[1] = $value;
+					
+						//Check what the relationship os between the return table and current obejct..
+					}else if( isset( $belongsTo[$returnField[0]] ) ){
+						
+						$object->{$returnField[0]}->$returnField[1] = $value;
+						
+					}else if( isset( $hasMany[$returnField[0]] ) ){
+						
+						$object->{$returnField[0]}[count($object->{$returnField[0]})-1]->$returnField[1] = $value;
+						
+					}
+				}
+				
+				$objects[] = $object;
+			}else{
+				
+				//Add the hasMany objects
+				//Get every value returned from the databae and add it to the object
+				//Check if there is hasMany objects, and add blank clones
+				foreach( $hasMany as $childModel => $childObject ){
+					
+					$object->{$childModel}[] = clone $childObject;
+				}
+					
+				foreach( $row as $key => $value ){
+					
+					
+					
+					//Find what object and field it is..
+					$returnField = explode(".",$key);
+					
+					foreach( $row as $key => $value ){
+						if( isset( $hasMany[$returnField[0]] ) ){
+							
+							//Found duplicate row, with hasMany
+							$object->{$returnField[0]}[count($object->{$returnField[0]})-1]->$returnField[1] = $value;
+							
+						}
+					}
+				}
+				
 			}
-			
-			$objects[] = $object;
 		}
 		
 		
@@ -376,81 +404,97 @@ abstract class Model{
 		$parameters = array();
 		$parameters[0]='';
 		
-		foreach( $conditions as $index => $value ){
-			
-			if( strtoupper($index) == "OR" ){
+		if( is_array($conditions)){
+			foreach( $conditions as $index => $value ){
 				
-				//If there is an or, it will contain an array or arrays, with the first element being one of the conditions
-				if( is_array( $value ) ){
+				if( strtoupper($index) == "OR" ){
 					
-					$orCondition = " ( ";
-					
-					foreach( $value as $subConditions ){
+					//If there is an or, it will contain an array or arrays, with the first element being one of the conditions
+					if( is_array( $value ) ){
 						
-						if( is_array( $subConditions ) ){
-							
-							$subProcessConditions = $this->processConditions( $subConditions );
-							$orCondition .= $subProcessConditions['conditionString']. " OR ";
-							$parameters[0] .= $subProcessConditions['parameters'][0];
-							
-							for( $i=1; $i<sizeof($subProcessConditions['parameters']);$i++){
+						$orCondition = " ( ";
+						
+						foreach( $value as $subConditions ){
+
+							if( is_array( $subConditions ) ){
 								
-								$parameters[] = $subProcessConditions['parameters'][$i];
+								$subProcessConditions = $this->processConditions( $subConditions );
+
+								$orCondition .= $subProcessConditions['conditionString']. " OR ";
+								$parameters[0] .= $subProcessConditions['parameters'][0];
+								
+								for( $i=1; $i<sizeof($subProcessConditions['parameters']);$i++){
+									
+									$parameters[] = $subProcessConditions['parameters'][$i];
+								}
 							}
+							
+						}
+						//Remove ORs and append the finish
+						$orCondition = rtrim($orCondition, " OR ");
+						$orCondition .= " ) AND ";
+					
+					}
+					
+					$conditionString.= $orCondition;
+					
+				
+				//Check if the index is a string (not numeric)...
+				}else if( !is_numeric( $index ) ){
+					
+					//If there is no operators in the index string then add the equals operator..
+					if( strpos( $index, '<' ) === false	&& strpos( $index, '>' ) === false && strpos( $index, '=' ) === false	&& strpos( $index, '!' ) === false )
+						$index.="=";
+					
+					//Check if there is a table specified in index, and if not add the current model..
+					if( strpos( $index, '.' ) === false )
+						$index = $this->objectName.".".$index;
+					
+					//In some cases the value may be a reference to another field, so we just manually add it..
+					if( is_array($value) && isset($value['field'])){
+						
+						$conditionString .= " $index ".$value['field']." AND ";
+					}else{
+					
+						$conditionString .= " $index ? AND ";
+						//Determine what type of data is being subbed in, and add it to the parameters string.
+						//Then add the value to the array..
+						if( is_float($value) ){
+							
+							$parameters[0] .= 'd';
+						}else if( is_numeric( $value )){
+							
+							$parameters[0] .= 'i';
+						}else{
+							
+							$parameters[0] .= 's';
 						}
 						
+						$parameters[] = $value;
 					}
-					//Remove ORs and append the finish
-					$orCondition = rtrim($orCondition, " OR ");
-					$orCondition .= " ) AND ";
-				
-				}
-				
-				$conditionString.= $orCondition;
-				
-			
-			//Check if the index is a string...
-			}else if( !is_numeric( $index ) ){
-				
-				//If there is no operators in the index string then add the equals operator..
-				if( strpos( $index, '<' ) === false	&& strpos( $index, '>' ) === false && strpos( $index, '=' ) === false	&& strpos( $index, '!' ) === false )
-					$index.="=";
-				
-				//Check if there is a table specified in index, and if not add the current model..
-				if( strpos( $index, '.' ) === false )
-					$index = $this->objectName.".".$index;
-				
-				$conditionString .= " ".$index." ? AND ";
-				
-				//Determine what type of data is being subbed in, and add it to the parameters string.
-				//Then add the value to the array..
-				if( is_float($value) ){
 					
-					$parameters[0] .= 'd';
-				}else if( is_numeric( $value )){
-					
-					$parameters[0] .= 'i';
 				}else{
 					
-					$parameters[0] .= 's';
-				}
-				
-				$parameters[] = $value;
-				
-			}else{
-				
-				
-				//If there was a numeric index given further inspection required
-				if( is_array($value) ){
 					
-					return $this->processConditions( $value );	
+					//If there was a numeric index given further inspection required
+					if( is_array($value) ){
+						
+						$innerConditions = $this->processConditions( $value );	
+					}
+	
+					//Need to add the inner conditions to condition return
+					$parameters[0] .= $innerConditions['parameters'][0];
+					$parameters = array_merge ( $parameters , array_slice($innerConditions['parameters'],1 ));
+					$conditionString .= $innerConditions['conditionString'];
+					
+					//Because these are sub conditions, we must append an AND:
+					$conditionString .= " AND ";
 				}
 			}
 		}
 		
 		//Remove trailing ANDs
 		$conditionString = rtrim($conditionString, " AND ");
-		
 		
 		return array('conditionString'=>$conditionString, 'parameters'=>$parameters);
 	}
